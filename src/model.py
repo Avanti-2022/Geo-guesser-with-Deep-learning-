@@ -1,9 +1,8 @@
-import torch
 from torch import nn
 
 
 class GeoCNN(nn.Module):
-    def __init__(self):
+    def __init__(self, number_of_countries=12):
         super().__init__()
 
         self.features = nn.Sequential(
@@ -22,8 +21,16 @@ class GeoCNN(nn.Module):
             nn.Linear(128, 2),
         )
 
+        self.country_classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, number_of_countries),
+        )
+
     @staticmethod
-    def _conv_block(input_channels, output_channels):
+    def _conv_block(
+        input_channels,
+        output_channels,
+    ):
         return nn.Sequential(
             nn.Conv2d(
                 input_channels,
@@ -39,8 +46,14 @@ class GeoCNN(nn.Module):
 
     def forward(self, images):
         features = self.features(images)
+
         coordinates = self.regressor(features)
-        return coordinates
+        country_logits = self.country_classifier(features)
+
+        return {
+            "coordinates": coordinates,
+            "country_logits": country_logits,
+        }
 
 
 def count_parameters(model):
