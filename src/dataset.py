@@ -33,20 +33,29 @@ class GeoDataset(Dataset):
         self,
         csv_file,
         image_dir,
-        image_size=224,
+        image_size=128,
     ):
         self.labels = pd.read_csv(csv_file)
         self.image_dir = Path(image_dir)
 
-        unknown_countries = (
-            set(self.labels["country"])
-            - set(COUNTRY_TO_INDEX)
+        required_columns = {
+            "filename",
+            "country",
+            "lat",
+            "lng",
+            "cell_id",
+            "offset_north_km",
+            "offset_east_km",
+        }
+
+        missing_columns = (
+            required_columns - set(self.labels.columns)
         )
 
-        if unknown_countries:
+        if missing_columns:
             raise ValueError(
-                "Unknown countries found: "
-                f"{sorted(unknown_countries)}"
+                "Missing CSV columns: "
+                f"{sorted(missing_columns)}"
             )
 
         self.transform = transforms.Compose(
@@ -83,10 +92,25 @@ class GeoDataset(Dataset):
             dtype=torch.long,
         )
 
+        cell_id = torch.tensor(
+            int(row["cell_id"]),
+            dtype=torch.long,
+        )
+
+        offsets = torch.tensor(
+            [
+                row["offset_north_km"],
+                row["offset_east_km"],
+            ],
+            dtype=torch.float32,
+        )
+
         return {
             "image": image,
             "coordinates": coordinates,
             "country_index": country_index,
+            "cell_id": cell_id,
+            "offsets": offsets,
             "filename": row["filename"],
             "country": row["country"],
         }
