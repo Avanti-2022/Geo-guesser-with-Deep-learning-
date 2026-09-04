@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from src.dataset import GeoDataset
+from src.dataset import COUNTRIES, GeoDataset
 from src.metrics import calculate_metrics
 from src.model import GeoCNN, count_parameters
 
@@ -16,29 +16,39 @@ IMAGE_SIZE = 128
 BATCH_SIZE = 32
 EPOCHS = 10
 LEARNING_RATE = 0.001
+COUNTRY_LOSS_WEIGHT = 0.25
 MAX_PARAMETERS = 5_000_000
 
 TRAIN_CSV = "data/splits/train.csv"
 VALIDATION_CSV = "data/splits/validation.csv"
 IMAGE_DIR = "data/train"
-CHECKPOINT_PATH = Path("outputs/checkpoints/best_model.pt")
+
+CHECKPOINT_PATH = Path(
+    "outputs/checkpoints/country_aware_best_model.pt"
+)
 
 
 def train_one_epoch(
     model,
     loader,
-    loss_function,
+    coordinate_loss_function,
+    country_loss_function,
     optimizer,
     coordinate_mean,
     coordinate_std,
     device,
 ):
     model.train()
+
     total_loss = 0.0
+    total_coordinate_loss = 0.0
+    total_country_loss = 0.0
+    correct_countries = 0
 
     for batch_number, batch in enumerate(loader, start=1):
         images = batch["image"].to(device)
         coordinates = batch["coordinates"].to(device)
+        country_indexes = batch["country_index"].to(device)
 
         normalized_coordinates = (
             coordinates - coordinate_mean
@@ -46,24 +56,62 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        predictions = model(images)
-        loss = loss_function(
-            predictions,
+        output = model(images)
+
+        coordinate_loss = coordinate_loss_function(
+            output["coordinates"],
             normalized_coordinates,
+        )
+
+        country_loss = country_loss_function(
+            output["country_logits"],
+            country_indexes,
+        )
+
+        loss = (
+            coordinate_loss
+            + COUNTRY_LOSS_WEIGHT * country_loss
         )
 
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * images.size(0)
+        batch_size = images.size(0)
+
+        total_loss += loss.item() * batch_size
+        total_coordinate_loss += (
+            coordinate_loss.item() * batch_size
+        )
+        total_country_loss += (
+            country_loss.item() * batch_size
+        )
+
+        predicted_countries = output[
+            "country_logits"
+        ].argmax(dim=1)
+
+        correct_countries += (
+            predicted_countries == country_indexes
+        ).sum().item()
 
         if batch_number % 50 == 0:
             print(
                 f"  Batch {batch_number}/{len(loader)} "
-                f"- loss: {loss.item():.4f}"
+                f"- total loss: {loss.item():.4f}"
             )
 
-    return total_loss / len(loader.dataset)
+    dataset_size = len(loader.dataset)
+
+    return {
+        "total_loss": total_loss / dataset_size,
+        "coordinate_loss": (
+            total_coordinate_loss / dataset_size
+        ),
+        "country_loss": total_country_loss / dataset_size,
+        "country_accuracy": (
+            100 * correct_countries / dataset_size
+        ),
+    }
 
 
 def validate(
@@ -78,19 +126,35 @@ def validate(
     actual_coordinates = []
     predicted_coordinates = []
 
+    correct_countries = 0
+    total_examples = 0
+
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
             coordinates = batch["coordinates"]
+            country_indexes = batch["country_index"].to(device)
 
-            normalized_predictions = model(images)
+            output = model(images)
 
             predictions = (
-                normalized_predictions * coordinate_std
+                output["coordinates"] * coordinate_std
                 + coordinate_mean
             )
 
-            actual_coordinates.append(coordinates.numpy())
+            predicted_countries = output[
+                "country_logits"
+            ].argmax(dim=1)
+
+            correct_countries += (
+                predicted_countries == country_indexes
+            ).sum().item()
+
+            total_examples += images.size(0)
+
+            actual_coordinates.append(
+                coordinates.numpy()
+            )
             predicted_coordinates.append(
                 predictions.cpu().numpy()
             )
@@ -99,17 +163,24 @@ def validate(
         actual_coordinates,
         axis=0,
     )
+
     predicted_coordinates = np.concatenate(
         predicted_coordinates,
         axis=0,
     )
 
-    return calculate_metrics(
+    metrics = calculate_metrics(
         true_lat=actual_coordinates[:, 0],
         true_lng=actual_coordinates[:, 1],
         pred_lat=predicted_coordinates[:, 0],
         pred_lng=predicted_coordinates[:, 1],
     )
+
+    metrics["country_accuracy"] = (
+        100 * correct_countries / total_examples
+    )
+
+    return metrics
 
 
 def main():
@@ -121,7 +192,8 @@ def main():
     )
 
     print(f"Using device: {device}")
-    print(f"Image size: {IMAGE_SIZE} x {IMAGE_SIZE}")
+    print(f"Countries: {len(COUNTRIES)}")
+    print(f"Country loss weight: {COUNTRY_LOSS_WEIGHT}")
 
     train_dataset = GeoDataset(
         csv_file=TRAIN_CSV,
@@ -165,12 +237,16 @@ def main():
         device=device,
     )
 
-    model = GeoCNN().to(device)
-    parameter_count = count_parameters(model)
+    model = GeoCNN(
+        number_of_countries=len(COUNTRIES)
+    ).to(device)
 
+    parameter_count = count_parameters(model)
     assert parameter_count <= MAX_PARAMETERS
 
-    loss_function = nn.SmoothL1Loss()
+    coordinate_loss_function = nn.SmoothL1Loss()
+    country_loss_function = nn.CrossEntropyLoss()
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=LEARNING_RATE,
@@ -184,19 +260,20 @@ def main():
     print(f"Training images: {len(train_dataset)}")
     print(f"Validation images: {len(validation_dataset)}")
     print(f"Parameter count: {parameter_count:,}")
-    print(f"Batches per epoch: {len(train_loader)}")
 
     best_median_distance = float("inf")
 
     for epoch in range(1, EPOCHS + 1):
         start_time = time.time()
-
         print(f"\nEpoch {epoch}/{EPOCHS}")
 
-        training_loss = train_one_epoch(
+        training_results = train_one_epoch(
             model=model,
             loader=train_loader,
-            loss_function=loss_function,
+            coordinate_loss_function=(
+                coordinate_loss_function
+            ),
+            country_loss_function=country_loss_function,
             optimizer=optimizer,
             coordinate_mean=coordinate_mean,
             coordinate_std=coordinate_std,
@@ -211,9 +288,22 @@ def main():
             device=device,
         )
 
-        elapsed_minutes = (time.time() - start_time) / 60
+        elapsed_minutes = (
+            time.time() - start_time
+        ) / 60
 
-        print(f"Training loss: {training_loss:.4f}")
+        print(
+            "Training coordinate loss: "
+            f"{training_results['coordinate_loss']:.4f}"
+        )
+        print(
+            "Training country accuracy: "
+            f"{training_results['country_accuracy']:.2f}%"
+        )
+        print(
+            "Validation country accuracy: "
+            f"{metrics['country_accuracy']:.2f}%"
+        )
         print(
             "Median distance: "
             f"{metrics['median_distance_km']:.2f} km"
@@ -243,14 +333,16 @@ def main():
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
-                    "coordinate_mean": (
-                        coordinate_mean.cpu()
-                    ),
+                    "coordinate_mean": coordinate_mean.cpu(),
                     "coordinate_std": coordinate_std.cpu(),
                     "image_size": IMAGE_SIZE,
-                    "parameter_count": parameter_count,
                     "epoch": epoch,
+                    "parameter_count": parameter_count,
                     "validation_metrics": metrics,
+                    "countries": COUNTRIES,
+                    "country_loss_weight": (
+                        COUNTRY_LOSS_WEIGHT
+                    ),
                 },
                 CHECKPOINT_PATH,
             )
