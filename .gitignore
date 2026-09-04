@@ -1,3 +1,14 @@
+# Supplied dataset
+data/train/
+data/holdout_public/
+data/train_labels.csv
+
+# Generated files
+outputs/checkpoints/
+outputs/logs/
+outputs/figures/
+outputs/predictions/
+
 # Virtual environment
 .venv/
 venv/
@@ -5,3 +16,4 @@ venv/
 # Python cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
