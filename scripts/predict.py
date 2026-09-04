@@ -10,9 +10,11 @@ from src.model import GeoCNN
 
 
 HOLDOUT_DIR = Path("data/holdout_public")
+
 CHECKPOINT_PATH = Path(
-    "outputs/checkpoints/best_model.pt"
+    "outputs/checkpoints/country_aware_best_model.pt"
 )
+
 OUTPUT_FILE = Path("predictions.csv")
 
 BATCH_SIZE = 32
@@ -28,7 +30,8 @@ class HoldoutDataset(Dataset):
             for path in self.image_dir.iterdir()
             if (
                 path.is_file()
-                and path.suffix.lower() in IMAGE_EXTENSIONS
+                and path.suffix.lower()
+                in IMAGE_EXTENSIONS
             )
         )
 
@@ -80,6 +83,7 @@ def main():
     )
 
     image_size = checkpoint["image_size"]
+    countries = checkpoint["countries"]
 
     dataset = HoldoutDataset(
         image_dir=HOLDOUT_DIR,
@@ -93,10 +97,14 @@ def main():
         num_workers=0,
     )
 
-    model = GeoCNN().to(device)
+    model = GeoCNN(
+        number_of_countries=len(countries)
+    ).to(device)
+
     model.load_state_dict(
         checkpoint["model_state_dict"]
     )
+
     model.eval()
 
     coordinate_mean = checkpoint[
@@ -113,12 +121,15 @@ def main():
 
     print(f"Holdout images: {len(dataset)}")
     print(
-        "Checkpoint epoch: "
-        f"{checkpoint['epoch']}"
+        f"Checkpoint epoch: {checkpoint['epoch']}"
     )
     print(
         "Checkpoint median distance: "
         f"{checkpoint['validation_metrics']['median_distance_km']:.2f} km"
+    )
+    print(
+        "Checkpoint country accuracy: "
+        f"{checkpoint['validation_metrics']['country_accuracy']:.2f}%"
     )
 
     with torch.no_grad():
@@ -128,19 +139,26 @@ def main():
         ):
             images = batch["image"].to(device)
 
-            normalized_predictions = model(images)
+            output = model(images)
+
+            normalized_predictions = output[
+                "coordinates"
+            ]
 
             predictions = (
-                normalized_predictions * coordinate_std
+                normalized_predictions
+                * coordinate_std
                 + coordinate_mean
             )
 
             predictions = predictions.cpu()
 
             filenames.extend(batch["filename"])
+
             predicted_latitudes.extend(
                 predictions[:, 0].tolist()
             )
+
             predicted_longitudes.extend(
                 predictions[:, 1].tolist()
             )
@@ -159,7 +177,6 @@ def main():
         }
     )
 
-    # Validate the result before saving.
     if len(predictions_df) != len(dataset):
         raise ValueError(
             "Prediction row count does not match "
@@ -203,6 +220,7 @@ def main():
         "Columns: "
         f"{predictions_df.columns.tolist()}"
     )
+
     print("\nFirst five predictions:")
     print(predictions_df.head())
 
