@@ -14,10 +14,12 @@ from src.model import GeoCNN, count_parameters
 SEED = 42
 IMAGE_SIZE = 128
 BATCH_SIZE = 32
-FINAL_EPOCH = 20
+EPOCHS = 20
 
-# Lower learning rate for continued training.
-LEARNING_RATE = 0.0002
+INITIAL_LEARNING_RATE = 0.001
+FINE_TUNING_LEARNING_RATE = 0.0002
+FINE_TUNING_START_EPOCH = 11
+
 COUNTRY_LOSS_WEIGHT = 0.25
 MAX_PARAMETERS = 5_000_000
 
@@ -111,9 +113,7 @@ def train_one_epoch(
     dataset_size = len(loader.dataset)
 
     return {
-        "total_loss": (
-            total_loss / dataset_size
-        ),
+        "total_loss": total_loss / dataset_size,
         "coordinate_loss": (
             total_coordinate_loss / dataset_size
         ),
@@ -145,6 +145,7 @@ def validate(
         for batch in loader:
             images = batch["image"].to(device)
             coordinates = batch["coordinates"]
+
             country_indexes = batch[
                 "country_index"
             ].to(device)
@@ -200,18 +201,36 @@ def validate(
     return metrics
 
 
+def create_optimizer(model, learning_rate):
+    return torch.optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
+    )
+
+
 def main():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
 
     print(f"Using device: {device}")
+    print(f"Image size: {IMAGE_SIZE} x {IMAGE_SIZE}")
     print(f"Countries: {len(COUNTRIES)}")
     print(f"Country loss weight: {COUNTRY_LOSS_WEIGHT}")
-    print(f"Learning rate: {LEARNING_RATE}")
+    print(
+        f"Initial learning rate: "
+        f"{INITIAL_LEARNING_RATE}"
+    )
+    print(
+        f"Fine-tuning learning rate: "
+        f"{FINE_TUNING_LEARNING_RATE}"
+    )
 
     train_dataset = GeoDataset(
         csv_file=TRAIN_CSV,
@@ -239,6 +258,22 @@ def main():
         num_workers=0,
     )
 
+    coordinate_mean = torch.tensor(
+        train_dataset.labels[["lat", "lng"]]
+        .mean()
+        .to_numpy(),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    coordinate_std = torch.tensor(
+        train_dataset.labels[["lat", "lng"]]
+        .std()
+        .to_numpy(),
+        dtype=torch.float32,
+        device=device,
+    )
+
     model = GeoCNN(
         number_of_countries=len(COUNTRIES)
     ).to(device)
@@ -247,35 +282,20 @@ def main():
 
     assert parameter_count <= MAX_PARAMETERS
 
-    if not CHECKPOINT_PATH.exists():
-        raise FileNotFoundError(
-            "Country-aware checkpoint not found: "
-            f"{CHECKPOINT_PATH}"
-        )
+    coordinate_loss_function = nn.SmoothL1Loss()
+    country_loss_function = nn.CrossEntropyLoss()
 
-    checkpoint = torch.load(
-        CHECKPOINT_PATH,
-        map_location=device,
-        weights_only=False,
+    current_learning_rate = INITIAL_LEARNING_RATE
+
+    optimizer = create_optimizer(
+        model,
+        current_learning_rate,
     )
 
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
+    CHECKPOINT_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-
-    coordinate_mean = checkpoint[
-        "coordinate_mean"
-    ].to(device)
-
-    coordinate_std = checkpoint[
-        "coordinate_std"
-    ].to(device)
-
-    start_epoch = checkpoint["epoch"] + 1
-
-    best_median_distance = checkpoint[
-        "validation_metrics"
-    ]["median_distance_km"]
 
     print(f"Training images: {len(train_dataset)}")
     print(
@@ -283,39 +303,35 @@ def main():
         f"{len(validation_dataset)}"
     )
     print(f"Parameter count: {parameter_count:,}")
-    print(
-        f"Resuming from epoch "
-        f"{checkpoint['epoch']}"
-    )
-    print(
-        "Previous best median distance: "
-        f"{best_median_distance:.2f} km"
-    )
+    print(f"Batches per epoch: {len(train_loader)}")
 
-    if start_epoch > FINAL_EPOCH:
-        print(
-            f"Checkpoint has already reached "
-            f"epoch {checkpoint['epoch']}."
-        )
-        return
+    best_median_distance = float("inf")
 
-    coordinate_loss_function = nn.SmoothL1Loss()
-    country_loss_function = nn.CrossEntropyLoss()
+    for epoch in range(1, EPOCHS + 1):
+        if epoch == FINE_TUNING_START_EPOCH:
+            current_learning_rate = (
+                FINE_TUNING_LEARNING_RATE
+            )
 
-    # A fresh optimizer is intentional because we are
-    # restarting with a lower learning rate.
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-    )
+            # A fresh optimizer matches the experiment
+            # used to produce the final model.
+            optimizer = create_optimizer(
+                model,
+                current_learning_rate,
+            )
 
-    for epoch in range(
-        start_epoch,
-        FINAL_EPOCH + 1,
-    ):
+            print(
+                "\nReduced learning rate to "
+                f"{current_learning_rate}"
+            )
+
         start_time = time.time()
 
-        print(f"\nEpoch {epoch}/{FINAL_EPOCH}")
+        print(f"\nEpoch {epoch}/{EPOCHS}")
+        print(
+            f"Learning rate: "
+            f"{current_learning_rate}"
+        )
 
         training_results = train_one_epoch(
             model=model,
@@ -345,8 +361,16 @@ def main():
         ) / 60
 
         print(
+            "Training total loss: "
+            f"{training_results['total_loss']:.4f}"
+        )
+        print(
             "Training coordinate loss: "
             f"{training_results['coordinate_loss']:.4f}"
+        )
+        print(
+            "Training country loss: "
+            f"{training_results['country_loss']:.4f}"
         )
         print(
             "Training country accuracy: "
@@ -398,16 +422,20 @@ def main():
                     ),
                     "image_size": IMAGE_SIZE,
                     "epoch": epoch,
-                    "parameter_count": (
-                        parameter_count
-                    ),
+                    "parameter_count": parameter_count,
                     "validation_metrics": metrics,
                     "countries": COUNTRIES,
                     "country_loss_weight": (
                         COUNTRY_LOSS_WEIGHT
                     ),
-                    "learning_rate": (
-                        LEARNING_RATE
+                    "initial_learning_rate": (
+                        INITIAL_LEARNING_RATE
+                    ),
+                    "fine_tuning_learning_rate": (
+                        FINE_TUNING_LEARNING_RATE
+                    ),
+                    "fine_tuning_start_epoch": (
+                        FINE_TUNING_START_EPOCH
                     ),
                 },
                 CHECKPOINT_PATH,
