@@ -14,8 +14,10 @@ from src.model import GeoCNN, count_parameters
 SEED = 42
 IMAGE_SIZE = 128
 BATCH_SIZE = 32
-EPOCHS = 10
-LEARNING_RATE = 0.001
+FINAL_EPOCH = 20
+
+# Lower learning rate for continued training.
+LEARNING_RATE = 0.0002
 COUNTRY_LOSS_WEIGHT = 0.25
 MAX_PARAMETERS = 5_000_000
 
@@ -76,14 +78,20 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
 
-        batch_size = images.size(0)
+        current_batch_size = images.size(0)
 
-        total_loss += loss.item() * batch_size
-        total_coordinate_loss += (
-            coordinate_loss.item() * batch_size
+        total_loss += (
+            loss.item() * current_batch_size
         )
+
+        total_coordinate_loss += (
+            coordinate_loss.item()
+            * current_batch_size
+        )
+
         total_country_loss += (
-            country_loss.item() * batch_size
+            country_loss.item()
+            * current_batch_size
         )
 
         predicted_countries = output[
@@ -103,11 +111,15 @@ def train_one_epoch(
     dataset_size = len(loader.dataset)
 
     return {
-        "total_loss": total_loss / dataset_size,
+        "total_loss": (
+            total_loss / dataset_size
+        ),
         "coordinate_loss": (
             total_coordinate_loss / dataset_size
         ),
-        "country_loss": total_country_loss / dataset_size,
+        "country_loss": (
+            total_country_loss / dataset_size
+        ),
         "country_accuracy": (
             100 * correct_countries / dataset_size
         ),
@@ -133,12 +145,15 @@ def validate(
         for batch in loader:
             images = batch["image"].to(device)
             coordinates = batch["coordinates"]
-            country_indexes = batch["country_index"].to(device)
+            country_indexes = batch[
+                "country_index"
+            ].to(device)
 
             output = model(images)
 
             predictions = (
-                output["coordinates"] * coordinate_std
+                output["coordinates"]
+                * coordinate_std
                 + coordinate_mean
             )
 
@@ -147,7 +162,8 @@ def validate(
             ].argmax(dim=1)
 
             correct_countries += (
-                predicted_countries == country_indexes
+                predicted_countries
+                == country_indexes
             ).sum().item()
 
             total_examples += images.size(0)
@@ -155,6 +171,7 @@ def validate(
             actual_coordinates.append(
                 coordinates.numpy()
             )
+
             predicted_coordinates.append(
                 predictions.cpu().numpy()
             )
@@ -194,6 +211,7 @@ def main():
     print(f"Using device: {device}")
     print(f"Countries: {len(COUNTRIES)}")
     print(f"Country loss weight: {COUNTRY_LOSS_WEIGHT}")
+    print(f"Learning rate: {LEARNING_RATE}")
 
     train_dataset = GeoDataset(
         csv_file=TRAIN_CSV,
@@ -221,51 +239,83 @@ def main():
         num_workers=0,
     )
 
-    coordinate_mean = torch.tensor(
-        train_dataset.labels[["lat", "lng"]]
-        .mean()
-        .to_numpy(),
-        dtype=torch.float32,
-        device=device,
-    )
-
-    coordinate_std = torch.tensor(
-        train_dataset.labels[["lat", "lng"]]
-        .std()
-        .to_numpy(),
-        dtype=torch.float32,
-        device=device,
-    )
-
     model = GeoCNN(
         number_of_countries=len(COUNTRIES)
     ).to(device)
 
     parameter_count = count_parameters(model)
+
     assert parameter_count <= MAX_PARAMETERS
+
+    if not CHECKPOINT_PATH.exists():
+        raise FileNotFoundError(
+            "Country-aware checkpoint not found: "
+            f"{CHECKPOINT_PATH}"
+        )
+
+    checkpoint = torch.load(
+        CHECKPOINT_PATH,
+        map_location=device,
+        weights_only=False,
+    )
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
+
+    coordinate_mean = checkpoint[
+        "coordinate_mean"
+    ].to(device)
+
+    coordinate_std = checkpoint[
+        "coordinate_std"
+    ].to(device)
+
+    start_epoch = checkpoint["epoch"] + 1
+
+    best_median_distance = checkpoint[
+        "validation_metrics"
+    ]["median_distance_km"]
+
+    print(f"Training images: {len(train_dataset)}")
+    print(
+        f"Validation images: "
+        f"{len(validation_dataset)}"
+    )
+    print(f"Parameter count: {parameter_count:,}")
+    print(
+        f"Resuming from epoch "
+        f"{checkpoint['epoch']}"
+    )
+    print(
+        "Previous best median distance: "
+        f"{best_median_distance:.2f} km"
+    )
+
+    if start_epoch > FINAL_EPOCH:
+        print(
+            f"Checkpoint has already reached "
+            f"epoch {checkpoint['epoch']}."
+        )
+        return
 
     coordinate_loss_function = nn.SmoothL1Loss()
     country_loss_function = nn.CrossEntropyLoss()
 
+    # A fresh optimizer is intentional because we are
+    # restarting with a lower learning rate.
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=LEARNING_RATE,
     )
 
-    CHECKPOINT_PATH.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    print(f"Training images: {len(train_dataset)}")
-    print(f"Validation images: {len(validation_dataset)}")
-    print(f"Parameter count: {parameter_count:,}")
-
-    best_median_distance = float("inf")
-
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(
+        start_epoch,
+        FINAL_EPOCH + 1,
+    ):
         start_time = time.time()
-        print(f"\nEpoch {epoch}/{EPOCHS}")
+
+        print(f"\nEpoch {epoch}/{FINAL_EPOCH}")
 
         training_results = train_one_epoch(
             model=model,
@@ -273,7 +323,9 @@ def main():
             coordinate_loss_function=(
                 coordinate_loss_function
             ),
-            country_loss_function=country_loss_function,
+            country_loss_function=(
+                country_loss_function
+            ),
             optimizer=optimizer,
             coordinate_mean=coordinate_mean,
             coordinate_std=coordinate_std,
@@ -320,7 +372,10 @@ def main():
             "Below 750 km: "
             f"{metrics['below_750_km']:.2f}%"
         )
-        print(f"Epoch time: {elapsed_minutes:.2f} minutes")
+        print(
+            f"Epoch time: "
+            f"{elapsed_minutes:.2f} minutes"
+        )
 
         if (
             metrics["median_distance_km"]
@@ -332,22 +387,36 @@ def main():
 
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
-                    "coordinate_mean": coordinate_mean.cpu(),
-                    "coordinate_std": coordinate_std.cpu(),
+                    "model_state_dict": (
+                        model.state_dict()
+                    ),
+                    "coordinate_mean": (
+                        coordinate_mean.cpu()
+                    ),
+                    "coordinate_std": (
+                        coordinate_std.cpu()
+                    ),
                     "image_size": IMAGE_SIZE,
                     "epoch": epoch,
-                    "parameter_count": parameter_count,
+                    "parameter_count": (
+                        parameter_count
+                    ),
                     "validation_metrics": metrics,
                     "countries": COUNTRIES,
                     "country_loss_weight": (
                         COUNTRY_LOSS_WEIGHT
                     ),
+                    "learning_rate": (
+                        LEARNING_RATE
+                    ),
                 },
                 CHECKPOINT_PATH,
             )
 
-            print(f"Saved best model: {CHECKPOINT_PATH}")
+            print(
+                f"Saved improved model: "
+                f"{CHECKPOINT_PATH}"
+            )
 
     print(
         "\nBest median validation distance: "
